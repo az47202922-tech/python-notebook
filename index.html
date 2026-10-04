@@ -55,6 +55,10 @@
   .out img { max-width: 100%; background: #fff; border-radius: 4px; display: block; margin: 6px 0; }
   .add { display: flex; gap: 8px; margin-left: 64px; }
   input[type=file] { display: none; }
+  select { font: inherit; font-size: 13px; padding: 5px 8px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--panel); color: var(--text); }
+  #files:empty { display: none; }
+  #files { padding: 8px 12px; border: 1px dashed var(--border); border-radius: 8px; }
   @media (max-width: 600px) {
     .cell { grid-template-columns: 1fr; } .gutter { text-align: left; padding: 0; display: flex; gap: 8px; align-items: center; }
     .gutter button { margin: 0; } .add { margin-left: 0; } #status { margin-left: 0; width: 100%; }
@@ -65,17 +69,25 @@
 <header>
   <div class="bar">
     <h1>🐍 Python 分段執行</h1>
+    <select id="nbSelect" title="切換筆記本">
+      <option value="demo">範例筆記本</option>
+      <option value="hmm_2state">2-state HMM（ARC）</option>
+    </select>
     <button id="runAll" class="primary" disabled>▶▶ 全部執行</button>
     <button id="restart" disabled>⟲ 重新啟動</button>
     <button id="clearOut">清除輸出</button>
     <button id="exportPy">下載 .py</button>
     <button id="importPy">匯入 .py</button>
     <input type="file" id="fileIn" accept=".py,.txt">
+    <button id="uploadData">📂 上傳檔案</button>
+    <input type="file" id="dataIn" multiple>
+    <button id="resetNb" title="捨棄修改，還原成原始版本">還原筆記本</button>
     <span id="status"><span class="dot" id="dot"></span><span id="statusText">載入 Python 中…</span></span>
   </div>
 </header>
 <main>
   <p class="hint">每一段程式可以單獨執行，變數會在各段之間保留。快捷鍵：<b>Shift+Enter</b> 執行並跳到下一段、<b>Ctrl+Enter</b> 執行。匯入 .py 時以 <code># %%</code> 分段。支援 numpy、pandas、matplotlib 等套件（第一次 import 會自動下載）。</p>
+  <div id="files" class="hint"></div>
   <div id="cells"></div>
   <div class="add">
     <button id="addCell">＋ 新增程式段</button>
@@ -84,7 +96,11 @@
 
 <script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
 <script>
-const STORE_KEY = 'py-notebook-cells-v1';
+const params = new URLSearchParams(location.search);
+const NOTEBOOKS = { demo: null, hmm_2state: 'hmm_2state.py' };
+let nbName = NOTEBOOKS.hasOwnProperty(params.get('nb')) ? params.get('nb') : 'demo';
+const storeKey = () => nbName === 'demo' ? 'py-notebook-cells-v1' : 'py-notebook-' + nbName;
+const uploaded = new Map();   // 檔名 -> Uint8Array（重新啟動時重新寫入）
 const DEFAULT_CELLS = [
   'print("Hello, Python!")\nx = 10\ny = 20',
   '# 上一段的變數在這裡還能用\nx + y',
@@ -104,13 +120,38 @@ function setStatus(text, state) {
 function save() {
   try {
     const codes = [...cellsEl.querySelectorAll('textarea')].map(t => t.value);
-    localStorage.setItem(STORE_KEY, JSON.stringify(codes));
+    localStorage.setItem(storeKey(), JSON.stringify(codes));
   } catch (e) {}
 }
-function load() {
-  try { const v = JSON.parse(localStorage.getItem(STORE_KEY)); if (Array.isArray(v) && v.length) return v; } catch (e) {}
-  return DEFAULT_CELLS;
+function splitCells(text) {
+  const parts = text.split(/^# ?%%.*$/m).map(s => s.replace(/^\n+|\n+$/g, '')).filter(s => s.length);
+  return parts.length ? parts : [''];
 }
+async function original() {
+  if (!NOTEBOOKS[nbName]) return DEFAULT_CELLS;
+  const r = await fetch(NOTEBOOKS[nbName] + '?v=' + Date.now());
+  if (!r.ok) throw new Error('無法載入 ' + NOTEBOOKS[nbName]);
+  return splitCells(await r.text());
+}
+async function load() {
+  try { const v = JSON.parse(localStorage.getItem(storeKey())); if (Array.isArray(v) && v.length) return v; } catch (e) {}
+  return original();
+}
+function render(codes) { cellsEl.innerHTML = ''; codes.forEach(c => createCell(c)); }
+async function openNotebook(name, fresh) {
+  nbName = name; $('nbSelect').value = name;
+  const u = new URL(location.href);
+  if (name === 'demo') u.searchParams.delete('nb'); else u.searchParams.set('nb', name);
+  history.replaceState(null, '', u);
+  try { render(fresh ? await original() : await load()); if (fresh) save(); }
+  catch (e) { render(['# ' + e.message]); }
+}
+function showFiles() {
+  $('files').innerHTML = uploaded.size
+    ? '📁 已上傳（只存在你的瀏覽器，不會傳到伺服器）：' + [...uploaded].map(([n, b]) => `<code>${n}</code> (${(b.length / 1e6).toFixed(1)} MB)`).join('、')
+    : '';
+}
+function writeUploads() { if (pyodide) for (const [n, b] of uploaded) pyodide.FS.writeFile(n, b); }
 
 function autosize(ta) { ta.style.height = 'auto'; ta.style.height = ta.scrollHeight + 'px'; }
 
@@ -228,7 +269,7 @@ async function initPython() {
 import os
 os.environ['MPLBACKEND'] = 'AGG'
 `);
-  pyodide = py; execCount = 0;
+  pyodide = py; execCount = 0; writeUploads();
   document.querySelectorAll('.count').forEach(c => c.textContent = '[ ]');
   document.querySelectorAll('.run').forEach(b => b.disabled = false);
   $('runAll').disabled = $('restart').disabled = false;
@@ -249,13 +290,22 @@ $('importPy').onclick = () => $('fileIn').click();
 $('fileIn').onchange = async e => {
   const f = e.target.files[0]; if (!f) return;
   const text = await f.text();
-  const parts = text.split(/^# ?%%.*$/m).map(s => s.replace(/^\n+|\n+$/g, '')).filter(s => s.length);
-  cellsEl.innerHTML = '';
-  (parts.length ? parts : ['']).forEach(p => createCell(p));
+  render(splitCells(text));
   save(); e.target.value = '';
 };
 
-load().forEach(c => createCell(c));
+$('uploadData').onclick = () => $('dataIn').click();
+$('dataIn').onchange = async e => {
+  for (const f of e.target.files) {
+    setStatus('讀取 ' + f.name + '…', 'busy');
+    uploaded.set(f.name, new Uint8Array(await f.arrayBuffer()));
+  }
+  writeUploads(); showFiles(); e.target.value = '';
+  setStatus(pyodide ? '就緒 · 檔案已上傳' : '載入 Python 中…', pyodide ? 'ready' : '');
+};
+$('nbSelect').onchange = e => openNotebook(e.target.value, false);
+$('resetNb').onclick = () => { if (confirm('捨棄這本筆記本的修改，還原成原始版本？')) openNotebook(nbName, true); };
+openNotebook(nbName, false);
 initPython().catch(e => setStatus('載入失敗：' + e.message));
 </script>
 </body>
