@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python 分段執行筆記本</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1f2328; --muted: #656d76;
+    --border: #d0d7de; --accent: #2563eb; --accent-weak: #e8efff;
+    --code-bg: #f6f8fa; --err: #cf222e; --ok: #1a7f37;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117; --panel: #161b22; --text: #e6edf3; --muted: #8d96a0;
+      --border: #30363d; --accent: #4f8cff; --accent-weak: #1b2a45;
+      --code-bg: #0d1117; --err: #ff7b72; --ok: #3fb950;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", "Noto Sans TC", "Microsoft JhengHei", sans-serif; }
+  header { position: sticky; top: 0; z-index: 10; background: var(--panel);
+    border-bottom: 1px solid var(--border); }
+  .bar { max-width: 960px; margin: 0 auto; padding: 10px 16px;
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  h1 { font-size: 17px; margin: 0 12px 0 0; }
+  #status { font-size: 13px; color: var(--muted); margin-left: auto; display: flex; align-items: center; gap: 6px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #d4a72c; }
+  .dot.ready { background: var(--ok); } .dot.busy { background: var(--accent); }
+  button { font: inherit; font-size: 13px; padding: 6px 10px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--panel); color: var(--text); cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  main { max-width: 960px; margin: 0 auto; padding: 16px; }
+  .hint { color: var(--muted); font-size: 13px; margin: 0 0 14px; }
+  .cell { display: grid; grid-template-columns: 56px 1fr; gap: 8px; margin-bottom: 14px; }
+  .gutter { text-align: right; font-family: ui-monospace, Consolas, monospace; font-size: 12px;
+    color: var(--muted); padding-top: 10px; }
+  .gutter button { margin-top: 6px; width: 34px; height: 34px; padding: 0; border-radius: 50%; }
+  .box { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .cell.active .box { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
+  textarea { display: block; width: 100%; border: 0; outline: 0; resize: none; overflow: hidden;
+    background: var(--code-bg); color: var(--text); padding: 10px 12px; min-height: 44px;
+    font: 14px/1.5 ui-monospace, "Cascadia Code", Consolas, monospace; tab-size: 4; }
+  .tools { display: flex; gap: 4px; justify-content: flex-end; padding: 4px 6px;
+    border-top: 1px solid var(--border); }
+  .tools button { padding: 2px 8px; font-size: 12px; }
+  .out { border-top: 1px solid var(--border); padding: 8px 12px; white-space: pre-wrap;
+    font: 13px/1.45 ui-monospace, Consolas, monospace; overflow-x: auto; }
+  .out:empty { display: none; }
+  .out .err { color: var(--err); }
+  .out .res { color: var(--muted); }
+  .out img { max-width: 100%; background: #fff; border-radius: 4px; display: block; margin: 6px 0; }
+  .add { display: flex; gap: 8px; margin-left: 64px; }
+  input[type=file] { display: none; }
+  @media (max-width: 600px) {
+    .cell { grid-template-columns: 1fr; } .gutter { text-align: left; padding: 0; display: flex; gap: 8px; align-items: center; }
+    .gutter button { margin: 0; } .add { margin-left: 0; } #status { margin-left: 0; width: 100%; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="bar">
+    <h1>🐍 Python 分段執行</h1>
+    <button id="runAll" class="primary" disabled>▶▶ 全部執行</button>
+    <button id="restart" disabled>⟲ 重新啟動</button>
+    <button id="clearOut">清除輸出</button>
+    <button id="exportPy">下載 .py</button>
+    <button id="importPy">匯入 .py</button>
+    <input type="file" id="fileIn" accept=".py,.txt">
+    <span id="status"><span class="dot" id="dot"></span><span id="statusText">載入 Python 中…</span></span>
+  </div>
+</header>
+<main>
+  <p class="hint">每一段程式可以單獨執行，變數會在各段之間保留。快捷鍵：<b>Shift+Enter</b> 執行並跳到下一段、<b>Ctrl+Enter</b> 執行。匯入 .py 時以 <code># %%</code> 分段。支援 numpy、pandas、matplotlib 等套件（第一次 import 會自動下載）。</p>
+  <div id="cells"></div>
+  <div class="add">
+    <button id="addCell">＋ 新增程式段</button>
+  </div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
+<script>
+const STORE_KEY = 'py-notebook-cells-v1';
+const DEFAULT_CELLS = [
+  'print("Hello, Python!")\nx = 10\ny = 20',
+  '# 上一段的變數在這裡還能用\nx + y',
+  'for i in range(1, 6):\n    print(i, "的平方是", i ** 2)',
+  'import matplotlib.pyplot as plt\nimport numpy as np\n\nt = np.linspace(0, 2 * np.pi, 200)\nplt.plot(t, np.sin(t), label="sin")\nplt.plot(t, np.cos(t), label="cos")\nplt.legend()\nplt.title("sin & cos")'
+];
+
+let pyodide = null, busy = false, execCount = 0;
+const cellsEl = document.getElementById('cells');
+const $ = id => document.getElementById(id);
+
+function setStatus(text, state) {
+  $('statusText').textContent = text;
+  $('dot').className = 'dot ' + (state || '');
+}
+
+function save() {
+  try {
+    const codes = [...cellsEl.querySelectorAll('textarea')].map(t => t.value);
+    localStorage.setItem(STORE_KEY, JSON.stringify(codes));
+  } catch (e) {}
+}
+function load() {
+  try { const v = JSON.parse(localStorage.getItem(STORE_KEY)); if (Array.isArray(v) && v.length) return v; } catch (e) {}
+  return DEFAULT_CELLS;
+}
+
+function autosize(ta) { ta.style.height = 'auto'; ta.style.height = ta.scrollHeight + 'px'; }
+
+function setActive(cell) {
+  cellsEl.querySelectorAll('.cell.active').forEach(c => c.classList.remove('active'));
+  if (cell) cell.classList.add('active');
+}
+
+function createCell(code = '', after = null) {
+  const cell = document.createElement('div');
+  cell.className = 'cell';
+  cell.innerHTML = `
+    <div class="gutter"><div class="count">[ ]</div><button class="run" title="執行 (Shift+Enter)" ${pyodide ? '' : 'disabled'}>▶</button></div>
+    <div class="box">
+      <textarea spellcheck="false" placeholder="在這裡輸入 Python 程式…"></textarea>
+      <div class="out"></div>
+      <div class="tools">
+        <button data-act="up" title="上移">↑</button>
+        <button data-act="down" title="下移">↓</button>
+        <button data-act="below" title="在下方新增">＋</button>
+        <button data-act="del" title="刪除">🗑</button>
+      </div>
+    </div>`;
+  const ta = cell.querySelector('textarea');
+  ta.value = code;
+  ta.addEventListener('input', () => { autosize(ta); save(); });
+  ta.addEventListener('focus', () => setActive(cell));
+  ta.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && (e.shiftKey || e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      runCell(cell).then(() => {
+        if (e.shiftKey) {
+          let next = cell.nextElementSibling;
+          if (!next) next = createCell('', cell);
+          next.querySelector('textarea').focus();
+        }
+      });
+    } else if (e.key === 'Tab') {
+      e.preventDefault();
+      const s = ta.selectionStart, en = ta.selectionEnd;
+      ta.setRangeText('    ', s, en, 'end');
+      autosize(ta); save();
+    }
+  });
+  cell.querySelector('.run').addEventListener('click', () => runCell(cell));
+  cell.querySelector('.tools').addEventListener('click', e => {
+    const act = e.target.dataset.act; if (!act) return;
+    if (act === 'up' && cell.previousElementSibling) cellsEl.insertBefore(cell, cell.previousElementSibling);
+    if (act === 'down' && cell.nextElementSibling) cellsEl.insertBefore(cell.nextElementSibling, cell);
+    if (act === 'below') createCell('', cell).querySelector('textarea').focus();
+    if (act === 'del') { cell.remove(); if (!cellsEl.children.length) createCell(''); }
+    save();
+  });
+  if (after) after.after(cell); else cellsEl.appendChild(cell);
+  requestAnimationFrame(() => autosize(ta));
+  return cell;
+}
+
+function appendOut(out, text, cls) {
+  const span = document.createElement('span');
+  if (cls) span.className = cls;
+  span.textContent = text;
+  out.appendChild(span);
+}
+
+async function runCell(cell) {
+  if (!pyodide) return;
+  while (busy) await new Promise(r => setTimeout(r, 50));
+  busy = true;
+  const ta = cell.querySelector('textarea'), out = cell.querySelector('.out'), count = cell.querySelector('.count');
+  out.innerHTML = ''; count.textContent = '[*]'; setStatus('執行中…', 'busy');
+  pyodide.setStdout({ batched: s => appendOut(out, s + '\n') });
+  pyodide.setStderr({ batched: s => appendOut(out, s + '\n', 'err') });
+  try {
+    await pyodide.loadPackagesFromImports(ta.value, { messageCallback: m => setStatus(m, 'busy') });
+    const result = await pyodide.runPythonAsync(ta.value);
+    if (result !== undefined && result !== null) {
+      const r = pyodide.globals.get('repr')(result);
+      appendOut(out, r + '\n', 'res');
+      if (result && result.destroy) result.destroy();
+    }
+  } catch (err) {
+    const msg = String(err.message || err);
+    const lines = msg.split('\n');
+    const i = lines.findIndex(l => l.includes('File "<exec>"'));
+    appendOut(out, (i >= 0 ? 'Traceback:\n' + lines.slice(i).join('\n') : msg), 'err');
+  }
+  // matplotlib 圖片
+  try {
+    const imgs = pyodide.runPython(`
+_imgs = []
+import sys
+if 'matplotlib.pyplot' in sys.modules:
+    import io, base64
+    import matplotlib.pyplot as _plt
+    for _n in _plt.get_fignums():
+        _b = io.BytesIO(); _plt.figure(_n).savefig(_b, format='png', bbox_inches='tight', dpi=110)
+        _imgs.append(base64.b64encode(_b.getvalue()).decode())
+    _plt.close('all')
+_imgs`).toJs();
+    imgs.forEach(b64 => { const im = document.createElement('img'); im.src = 'data:image/png;base64,' + b64; out.appendChild(im); });
+  } catch (e) {}
+  count.textContent = `[${++execCount}]`;
+  setStatus('就緒', 'ready');
+  busy = false;
+}
+
+async function initPython() {
+  setStatus('載入 Python 中…（第一次約需數秒）');
+  $('runAll').disabled = $('restart').disabled = true;
+  document.querySelectorAll('.run').forEach(b => b.disabled = true);
+  pyodide = null;
+  const py = await loadPyodide();
+  py.runPython(`
+import os
+os.environ['MPLBACKEND'] = 'AGG'
+`);
+  pyodide = py; execCount = 0;
+  document.querySelectorAll('.count').forEach(c => c.textContent = '[ ]');
+  document.querySelectorAll('.run').forEach(b => b.disabled = false);
+  $('runAll').disabled = $('restart').disabled = false;
+  setStatus('就緒 · Python ' + py.runPython('import sys; sys.version.split()[0]'), 'ready');
+}
+
+$('addCell').onclick = () => { createCell('').querySelector('textarea').focus(); save(); };
+$('runAll').onclick = async () => { for (const c of [...cellsEl.children]) await runCell(c); };
+$('restart').onclick = () => initPython().catch(e => setStatus('載入失敗：' + e.message));
+$('clearOut').onclick = () => { document.querySelectorAll('.out').forEach(o => o.innerHTML = ''); document.querySelectorAll('.count').forEach(c => c.textContent = '[ ]'); };
+$('exportPy').onclick = () => {
+  const text = [...cellsEl.querySelectorAll('textarea')].map(t => '# %%\n' + t.value).join('\n\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type: 'text/x-python' }));
+  a.download = 'notebook.py'; a.click();
+};
+$('importPy').onclick = () => $('fileIn').click();
+$('fileIn').onchange = async e => {
+  const f = e.target.files[0]; if (!f) return;
+  const text = await f.text();
+  const parts = text.split(/^# ?%%.*$/m).map(s => s.replace(/^\n+|\n+$/g, '')).filter(s => s.length);
+  cellsEl.innerHTML = '';
+  (parts.length ? parts : ['']).forEach(p => createCell(p));
+  save(); e.target.value = '';
+};
+
+load().forEach(c => createCell(c));
+initPython().catch(e => setStatus('載入失敗：' + e.message));
+</script>
+</body>
+</html>
