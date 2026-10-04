@@ -117,10 +117,12 @@ function setStatus(text, state) {
   $('dot').className = 'dot ' + (state || '');
 }
 
+let srcVersion = '';           // 原始筆記本內容的指紋，用來偵測 GitHub 上的檔案是否更新
+function fingerprint(t) { let h = 5381; for (let i = 0; i < t.length; i++) h = (h * 33 + t.charCodeAt(i)) | 0; return t.length + ':' + h; }
 function save() {
   try {
     const codes = [...cellsEl.querySelectorAll('textarea')].map(t => t.value);
-    localStorage.setItem(storeKey(), JSON.stringify(codes));
+    localStorage.setItem(storeKey(), JSON.stringify({ version: srcVersion, cells: codes }));
   } catch (e) {}
 }
 function splitCells(text) {
@@ -128,23 +130,36 @@ function splitCells(text) {
   return parts.length ? parts : [''];
 }
 async function original() {
-  if (!NOTEBOOKS[nbName]) return DEFAULT_CELLS;
-  const r = await fetch(NOTEBOOKS[nbName] + '?v=' + Date.now());
+  if (!NOTEBOOKS[nbName]) { srcVersion = 'demo'; return DEFAULT_CELLS; }
+  const r = await fetch(NOTEBOOKS[nbName] + '?v=' + Date.now(), { cache: 'no-store' });
   if (!r.ok) throw new Error('無法載入 ' + NOTEBOOKS[nbName]);
-  return splitCells(await r.text());
+  const text = await r.text();
+  srcVersion = fingerprint(text);
+  return splitCells(text);
 }
 async function load() {
-  try { const v = JSON.parse(localStorage.getItem(storeKey())); if (Array.isArray(v) && v.length) return v; } catch (e) {}
-  return original();
+  const fresh = await original();
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem(storeKey())); } catch (e) {}
+  if (Array.isArray(saved) && nbName === 'demo') return saved;               // 舊版範例存檔
+  if (saved && saved.version === srcVersion && Array.isArray(saved.cells) && saved.cells.length) return saved.cells;
+  if (saved) { try { localStorage.removeItem(storeKey()); } catch (e) {} updatedNotice = true; }
+  return fresh;                                                               // 原始檔已更新 → 用最新版
 }
+let updatedNotice = false;
 function render(codes) { cellsEl.innerHTML = ''; codes.forEach(c => createCell(c)); }
 async function openNotebook(name, fresh) {
   nbName = name; $('nbSelect').value = name;
   const u = new URL(location.href);
   if (name === 'demo') u.searchParams.delete('nb'); else u.searchParams.set('nb', name);
   history.replaceState(null, '', u);
+  updatedNotice = false;
   try { render(fresh ? await original() : await load()); if (fresh) save(); }
   catch (e) { render(['# ' + e.message]); }
+  noticeUpdate();
+}
+function noticeUpdate() {
+  if (updatedNotice) { $('files').innerHTML = '🔄 筆記本已更新為 GitHub 上的最新版本（先前在這台電腦的修改已被取代）。'; updatedNotice = false; }
 }
 function showFiles() {
   $('files').innerHTML = uploaded.size
