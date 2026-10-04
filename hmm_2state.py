@@ -10,7 +10,8 @@
 #   [4] 7:3 切分訓練/測試集  [5] HMM 函式  [6] 訓練
 #   [7] 查看模型參數  [8] 解碼與作圖
 # ============================================================
-import os, glob, re, time
+import os, glob, re, time, warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)   # 隱藏 pandas 的 pyarrow 提示
 import numpy as np
 import pandas as pd
 
