@@ -8,7 +8,9 @@
 # 各段內容：
 #   [1] 參數設定  [2] 讀取 ARC  [3] 計算每個 H 的 r1、r2、角度
 #   [4] 7:3 切分訓練/測試集  [5] HMM 函式  [6] 訓練
-#   [7] 查看模型參數  [8] 解碼與作圖
+#   [7] 查看模型參數  [8] 解碼與作圖  [9] 轉移矩陣熱圖
+#   [10] 質子移轉事件判定（L→S→L）  [11] 測試集共享期盒型圖
+#   [12] 各事件鄰近氧原子距離演化
 # ============================================================
 import os, glob, re, time, warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)   # 隱藏 pandas 的 pyarrow 提示
@@ -301,3 +303,99 @@ for f in fits:
     ax.plot(f["history"], label=f"restart {f['restart']}")
 ax.set_xlabel("Iteration"); ax.set_ylabel("Train log-likelihood"); ax.legend(frameon=False)
 fig.tight_layout()
+
+# %%
+# [9] 轉移機率矩陣熱圖（報告圖 6）
+order = [shared, localized]                     # 列/欄順序：Shared-like, Localized-like
+A = trans[np.ix_(order, order)]
+labels = [state_names[s] for s in order]
+fig, ax = plt.subplots(figsize=(5.2, 4.2))
+im = ax.imshow(A, cmap="Blues", vmin=0, vmax=1)
+for i in range(2):
+    for j in range(2):
+        ax.text(j, i, f"{A[i, j]:.4f}", ha="center", va="center",
+                color="white" if A[i, j] > 0.5 else "black")
+ax.set_xticks([0, 1]); ax.set_xticklabels(labels)
+ax.set_yticks([0, 1]); ax.set_yticklabels(labels)
+ax.set_title("Transition matrix")
+fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+fig.tight_layout()
+print(pd.DataFrame(A, index=labels, columns=labels).round(4).to_string())
+
+# %%
+# [10] 質子移轉事件判定
+#   1. 以 Viterbi 解碼的狀態序列，找出完整的 L → S → L 片段（Localized → Shared → Localized）
+#   2. 記錄進入 S 前最後一個 L frame 的最近氧 O_A，以及回到 L 第一個 frame 的最近氧 O_B
+#   3. 若 O_A ≠ O_B，判定為質子移轉候選事件；O_A = O_B 則視為震盪後回到原氧（不計）
+def lsl_episodes(hdf):
+    st = (hdf["state"].to_numpy() == "Shared-like")          # True = S, False = L
+    ox, fr = hdf["O1_ID"].to_numpy(), hdf["Frame"].to_numpy()
+    rows = []
+    for b in np.where(~st[:-1] & st[1:])[0] + 1:              # L→S 的第一個 S frame
+        back = np.where(~st[b:])[0]
+        if not len(back):                                     # 軌跡結束前沒有回到 L，不算完整片段
+            continue
+        e = b + int(back[0])                                  # 回到 L 的第一個 frame
+        rows.append({
+            "H_ID": int(hdf["H_ID"].iloc[0]), "split": hdf["split"].iloc[0],
+            "shared_start_frame": int(fr[b]), "shared_end_frame": int(fr[e - 1]),
+            "shared_duration_fs": float(e - b),               # 1 frame = 1 fs
+            "O_A": int(ox[b - 1]), "O_B": int(ox[e]),
+        })
+    return rows
+
+episodes = pd.DataFrame([r for _, g in decoded.groupby("H_ID", sort=True)
+                         for r in lsl_episodes(g.sort_values("Frame"))])
+episodes["PT_candidate"] = episodes["O_A"] != episodes["O_B"]
+pt = episodes[episodes["PT_candidate"]].reset_index(drop=True)
+pt.insert(0, "PT_id", np.arange(1, len(pt) + 1))
+
+print("完整 L→S→L 片段數：")
+print(episodes.groupby("split")["PT_candidate"].agg(L_S_L片段="count", 質子移轉候選="sum").to_string())
+test_pt = pt[pt["split"] == "test"].reset_index(drop=True)
+print(f"\n測試集質子移轉候選事件（{len(test_pt)} 筆）：")
+print(test_pt[["H_ID", "shared_start_frame", "shared_end_frame", "shared_duration_fs", "O_A", "O_B"]].to_string(index=False))
+
+# %%
+# [11] 測試集質子移轉候選事件：中間 Shared-like 持續時間盒型圖（報告圖 7）
+fig, ax = plt.subplots(figsize=(8.2, 4.8))
+if len(test_pt):
+    ax.boxplot(test_pt["shared_duration_fs"], showfliers=True)
+    xs = np.linspace(0.90, 1.10, len(test_pt))
+    cmap = plt.get_cmap("tab10")
+    for k, (h, g) in enumerate(test_pt.groupby("H_ID", sort=True)):
+        rng_txt = "; ".join(f"{a}-{b} fs" for a, b in zip(g["shared_start_frame"], g["shared_end_frame"]))
+        ax.scatter(xs[g.index], g["shared_duration_fs"], s=55, color=cmap(k % 10),
+                   edgecolor="black", linewidth=0.5, zorder=3, label=f"H{h} (S: {rng_txt})")
+    ax.legend(title="Hydrogen atom", frameon=False, fontsize=8, title_fontsize=9,
+              loc="upper left", bbox_to_anchor=(1.02, 1))
+    ax.set_xticks([1]); ax.set_xticklabels(["Test set"])
+    print(test_pt["shared_duration_fs"].describe().round(1).to_string())
+else:
+    ax.text(0.5, 0.5, "No test-set PT candidates", ha="center", va="center")
+ax.set_ylabel("Middle Shared-like duration in L-S-L (fs)")
+ax.set_title("Test-set PT-containing L-S-L episodes")
+fig.tight_layout()
+
+# %%
+# [12] 各測試集事件：H 與最近兩顆氧原子的距離隨時間演化，依氧原子編號上色（報告圖 8）
+hs = sorted(test_pt["H_ID"].unique())
+if hs:
+    ncol = 2
+    nrow = (len(hs) + 1) // ncol
+    fig, axes = plt.subplots(nrow, ncol, figsize=(12, 3.6 * nrow), squeeze=False)
+    for ax, h in zip(axes.ravel(), hs):
+        g = data[data["H_ID"] == h].sort_values("Frame")
+        pts = pd.concat([g[["Frame", "O1_ID", "r1_A"]].set_axis(["Frame", "O", "r"], axis=1),
+                         g[["Frame", "O2_ID", "r2_A"]].set_axis(["Frame", "O", "r"], axis=1)])
+        for k, (o, q) in enumerate(pts.groupby("O", sort=False)):
+            ax.scatter(q["Frame"], q["r"], s=4, color=plt.get_cmap("tab20")(k % 20), label=f"O{o}")
+        for _, ev in test_pt[test_pt["H_ID"] == h].iterrows():
+            ax.axvspan(ev["shared_start_frame"], ev["shared_end_frame"], color="#D46A4C", alpha=0.12)
+        ax.set_title(f"H{h}: nearest 2 O atoms by frame")
+        ax.set_xlabel("Frame (fs)"); ax.set_ylabel("Distance (Å)")
+        ax.legend(title="Nearest O atom", fontsize=7, markerscale=3, ncol=2, frameon=False)
+    for ax in axes.ravel()[len(hs):]:
+        ax.axis("off")
+    fig.tight_layout()
+    print("淡紅色區塊 = 該事件中間的 Shared-like 區段")
