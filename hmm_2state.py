@@ -11,9 +11,6 @@
 #   [7] 查看模型參數  [8] 解碼與作圖  [9] 轉移矩陣熱圖
 #   [10] 質子移轉事件判定（L→S→L）  [11] 測試集共享期盒型圖
 #   [12] 各事件鄰近氧原子距離演化
-#   ── 第二層 2-state HMM（移轉 / 未移轉）──
-#   [13] 建立 δ(t) 序列  [14] 訓練第二層 HMM  [15] 判定與比較
-#   [16] 第二層作圖  [17] 各事件 δ(t) 與解碼狀態
 # ============================================================
 import os, glob, re, time, warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)   # 隱藏 pandas 的 pyarrow 提示
@@ -26,7 +23,8 @@ TRAIN_RATIO = 0.7        # 訓練集比例（7:3）
 RESTARTS = 3             # Baum–Welch 重新起始次數
 MAX_ITER = 200           # 每次起始最多迭代次數
 LOG_GAP_OFFSET_A = 0.001 # log(Δr + 0.001 Å)，避免 Δr = 0 時取 log 發散
-FEATURES = ["r1_A", "r2_A", "gap_A", "log_gap", "O1_H_O2_angle_deg"]
+# 模型學習用的觀測特徵：r1、log(Δr + 0.001 Å)、O1–H–O2 角度
+FEATURES = ["r1_A", "log_gap", "O1_H_O2_angle_deg"]
 
 if ARC_PATH is None:
     found = sorted(glob.glob("*.arc") + glob.glob("*.ARC"))
@@ -120,7 +118,7 @@ def h_geometry(frames):
 t0 = time.time()
 data = h_geometry(frames)
 print(f"共 {data['H_ID'].nunique()} 個 H × {data['Frame'].nunique()} frames = {len(data)} 筆（{time.time() - t0:.1f} s）")
-print(data[FEATURES].describe().round(3).to_string())
+print(data[["r1_A", "r2_A", "gap_A", "log_gap", "O1_H_O2_angle_deg"]].describe().round(3).to_string())
 data.head(10)
 
 # %%
@@ -198,7 +196,8 @@ def fit_hmm(x, seed=42, restarts=3, max_iter=200, verbose=True):
     fits = []
     for r in range(restarts):
         rng = np.random.default_rng(seed + r)
-        q25, q75 = np.quantile(x[:, :, 2].ravel(), [0.25, 0.75])   # 以 gap 特徵初始化兩個狀態
+        g = FEATURES.index("log_gap")
+        q25, q75 = np.quantile(x[:, :, g].ravel(), [0.25, 0.75])   # 以 log(Δr) 特徵初始化兩個狀態
         means = np.vstack([np.full(F, q25), np.full(F, q75)]) + rng.normal(0, 0.05, (2, F))
         variances = np.tile(np.var(x.reshape(-1, F), axis=0) + 0.05, (2, 1))
         start = np.array([0.5, 0.5])
@@ -402,225 +401,3 @@ if hs:
         ax.axis("off")
     fig.tight_layout()
     print("淡紅色區塊 = 該事件中間的 Shared-like 區段")
-
-# %%
-# ============================================================
-# 第二層 2-state HMM：判斷每個 L→S→L 片段「有沒有移轉」
-# ------------------------------------------------------------
-# 想法：第一層 HMM 只告訴我們質子處於 Localized 或 Shared，
-#       第二層則針對每個 L→S→L 片段，固定一對氧原子：
-#         O_A = 進入 S 前的最近氧（原本的供體）
-#         O_B = S 期間最常出現的另一顆氧（可能的受體）
-#       觀測值為質子座標 δ(t) = r(H, O_A) − r(H, O_B)
-#         δ < 0：質子在 O_A 側；δ > 0：質子在 O_B 側
-#       以 2-state HMM 學習「O_A 側（未移轉）」與「O_B 側（已移轉）」。
-#       兩個狀態設為對稱（平均值 −m / +m、共用變異數），因為交換 O_A 與 O_B 時 δ 只是變號；
-#       δ ≈ 0 的共享構型兩側都可能，由轉移機率（時間連續性）決定，因此短暫震盪（rattling）不會被判成移轉。
-# [13] 建立每個片段的 δ(t) 序列
-# ============================================================
-PRE_FS, POST_FS = 20, 20        # 片段前後各多取的 fs 數（前段 L、後段 L）
-STABLE_FS = 10                  # 判定移轉：回到 L 後需在 O_B 側連續停留的 fs 數
-
-frame_index = [{int(a): k for k, a in enumerate(fr["ids"])} for fr in frames]
-
-cell_inv = [np.linalg.inv(fr["cell"]) for fr in frames]
-
-def pair_distances(frame_numbers, a, b):
-    """H(a) 到 O(b) 在多個 frame 的最小映像距離"""
-    out = np.empty(len(frame_numbers))
-    for k, f in enumerate(frame_numbers):
-        fr, idx = frames[f - 1], frame_index[f - 1]
-        d = fr["xyz"][idx[b]] - fr["xyz"][idx[a]]
-        q = d @ cell_inv[f - 1]
-        out[k] = np.linalg.norm((q - np.round(q)) @ fr["cell"])
-    return out
-
-seqs = []
-for ep_id, ep in episodes.reset_index(drop=True).iterrows():
-    h = int(ep["H_ID"]); s0, s1 = int(ep["shared_start_frame"]), int(ep["shared_end_frame"])
-    g = data[data["H_ID"] == h].set_index("Frame")
-    during = pd.concat([g.loc[s0:s1, "O1_ID"], g.loc[s0:s1, "O2_ID"]])
-    others = during[during != ep["O_A"]]
-    if others.empty:
-        continue
-    oA, oB = int(ep["O_A"]), int(others.value_counts().idxmax())
-    f_lo, f_hi = max(1, s0 - PRE_FS), min(len(frames), s1 + 1 + POST_FS)
-    fr_range = np.arange(f_lo, f_hi + 1)
-    delta = pair_distances(fr_range, h, oA) - pair_distances(fr_range, h, oB)
-    seqs.append(dict(ep_id=ep_id, H_ID=h, split=ep["split"], O_A=oA, O_B=oB,
-                     s0=s0, s1=s1, frames=fr_range, delta=delta,
-                     layer1_PT=bool(ep["PT_candidate"]), dur=float(ep["shared_duration_fs"])))
-
-print(f"共 {len(seqs)} 個 L→S→L 片段（訓練 {sum(s['split'] == 'train' for s in seqs)}、"
-      f"測試 {sum(s['split'] == 'test' for s in seqs)}）")
-print(f"每段序列長度：{min(len(s['delta']) for s in seqs)}–{max(len(s['delta']) for s in seqs)} frames")
-
-# %%
-# [14] 第二層 HMM：可處理不同長度序列的 1 維高斯 HMM（用遮罩補齊長度），以訓練集片段訓練
-def pad(seq_list):
-    T = max(len(s) for s in seq_list)
-    X = np.zeros((len(seq_list), T)); Mk = np.zeros((len(seq_list), T), bool)
-    for i, s in enumerate(seq_list):
-        X[i, :len(s)] = s; Mk[i, :len(s)] = True
-    return X, Mk
-
-def fb_masked(X, Mk, start, A, mu, var):
-    e = -0.5 * (np.log(2 * np.pi * var)[None, None] + (X[:, :, None] - mu) ** 2 / var)
-    e = np.where(Mk[:, :, None], e, 0.0)            # 補齊的 frame 不提供觀測資訊
-    lA, N, T = np.log(A), X.shape[0], X.shape[1]
-    a = np.empty((N, T, 2)); a[:, 0] = np.log(start) + e[:, 0]
-    for t in range(1, T):
-        a[:, t] = e[:, t] + logsumexp(a[:, t - 1, :, None] + lA[None], axis=1)
-    ll = logsumexp(a[:, -1], axis=1)
-    b = np.zeros((N, T, 2))
-    for t in range(T - 2, -1, -1):
-        b[:, t] = logsumexp(lA[None] + e[:, t + 1, None, :] + b[:, t + 1, None, :], axis=2)
-    gamma = np.exp(a + b - ll[:, None, None]) * Mk[:, :, None]
-    xi = np.exp(a[:, :-1, :, None] + lA[None, None] + e[:, 1:, None, :] + b[:, 1:, None, :]
-                - ll[:, None, None, None]) * Mk[:, 1:, None, None]
-    return ll, gamma, xi, e
-
-def viterbi_masked(X, Mk, start, A, mu, var):
-    e = -0.5 * (np.log(2 * np.pi * var)[None, None] + (X[:, :, None] - mu) ** 2 / var)
-    e = np.where(Mk[:, :, None], e, 0.0)
-    lA, N, T = np.log(A), X.shape[0], X.shape[1]
-    score = np.log(start) + e[:, 0]; back = np.zeros((N, T, 2), np.int8)
-    for t in range(1, T):
-        ch = score[:, :, None] + lA[None]
-        back[:, t] = ch.argmax(axis=1); score = e[:, t] + ch.max(axis=1)
-    path = np.empty((N, T), int); path[:, -1] = score.argmax(axis=1)
-    for t in range(T - 1, 0, -1):
-        path[:, t - 1] = back[np.arange(N), t, path[:, t]]
-    return path
-
-train_seqs = [s for s in seqs if s["split"] == "train"]
-Xtr, Mtr = pad([s["delta"] for s in train_seqs])
-start2 = np.array([0.5, 0.5]); A2 = np.array([[0.99, 0.01], [0.01, 0.99]])
-mu2 = np.array([-0.5, 0.5]); var2 = np.array([0.1, 0.1])
-prev = -np.inf
-t0 = time.time()
-for it in range(1, MAX_ITER + 1):
-    ll, gamma, xi, _ = fb_masked(Xtr, Mtr, start2, A2, mu2, var2)
-    total = float(ll.sum())
-    w = gamma.sum(axis=(0, 1)) + EPS
-    start2 = gamma[:, 0].mean(axis=0) + 1e-6; start2 /= start2.sum()
-    A2 = xi.sum(axis=(0, 1)) + 1e-3; A2 /= A2.sum(axis=1, keepdims=True)
-    # 對稱限制：O_A 側與 O_B 側互為鏡像（μ_A = −m、μ_B = +m，共用變異數）
-    m = float((gamma[:, :, 1] * Xtr - gamma[:, :, 0] * Xtr).sum() / w.sum())
-    mu2 = np.array([-m, m])
-    var2 = np.full(2, max(float((gamma * (Xtr[:, :, None] - mu2) ** 2).sum() / w.sum()), 1e-4))
-    if it > 3 and abs(total - prev) < 1e-6 * (1 + abs(prev)):
-        break
-    prev = total
-side_A = int(np.argmin(mu2)); side_B = 1 - side_A
-names2 = {side_A: "O_A side (not transferred)", side_B: "O_B side (transferred)"}
-print(f"對稱高斯：m = {m:.4f} Å")
-print(f"第二層 HMM 訓練完成：{it} 次迭代，{time.time() - t0:.1f} s，log-likelihood = {total:.1f}\n")
-o2 = [side_A, side_B]; lab2 = ["O_A side", "O_B side"]
-print("初始機率：", dict(zip(lab2, start2[o2].round(4))))
-print("轉移矩陣（列 = 目前，欄 = 下一個）：")
-print(pd.DataFrame(A2[np.ix_(o2, o2)], index=lab2, columns=lab2).round(4).to_string())
-print("\n發射分布（δ = r(H,O_A) − r(H,O_B)，Å）：")
-print(pd.DataFrame({"mean_δ": mu2[o2], "std_δ": np.sqrt(var2[o2]),
-                    "平均停留時間_fs": 1 / (1 - np.diag(A2)[o2])}, index=lab2).round(4).to_string())
-
-# %%
-# [15] 用第二層 HMM 解碼所有片段，判定是否移轉，並與第一層規則（O_A ≠ O_B）比較
-#   第二層判定為「移轉」：回到 L 的那個 frame 起，Viterbi 狀態在 O_B 側連續停留 ≥ STABLE_FS
-X_all, M_all = pad([s["delta"] for s in seqs])
-path2 = viterbi_masked(X_all, M_all, start2, A2, mu2, var2)
-_, post2, _, _ = fb_masked(X_all, M_all, start2, A2, mu2, var2)     # 每個 frame 在 O_B 側的後驗機率
-rows = []
-for i, s in enumerate(seqs):
-    p = path2[i, :len(s["delta"])]
-    ret = int(np.where(s["frames"] == s["s1"] + 1)[0][0]) if (s["s1"] + 1) in s["frames"] else len(p) - 1
-    after = p[ret:ret + STABLE_FS]
-    started_A = p[0] == side_A
-    transferred = bool(started_A and len(after) == STABLE_FS and np.all(after == side_B))
-    s["path"] = p
-    sw = np.where((p[1:] == side_B) & (p[:-1] == side_A))[0] + 1     # A→B 切換點
-    sw = sw[sw <= ret]
-    transfer_frame = int(s["frames"][sw[-1]]) if (transferred and len(sw)) else None   # 最後一次（確定）越過的時間
-    p_transfer = float(post2[i, ret:ret + STABLE_FS, side_B].mean()) if len(after) else np.nan
-    rows.append(dict(H_ID=s["H_ID"], split=s["split"], shared_start_frame=s["s0"], shared_end_frame=s["s1"],
-                     shared_duration_fs=s["dur"], O_A=s["O_A"], O_B=s["O_B"],
-                     layer1_PT=s["layer1_PT"], layer2_PT=transferred, P_transfer=round(p_transfer, 4),
-                     transfer_frame=transfer_frame,
-                     n_side_switches=int(np.sum(p[1:] != p[:-1]))))
-judge = pd.DataFrame(rows)
-judge["transfer_frame"] = judge["transfer_frame"].astype("Int64")
-for sp in ["train", "test"]:
-    j = judge[judge["split"] == sp]
-    print(f"【{sp}】第一層規則 vs 第二層 HMM（列 = 第一層，欄 = 第二層）")
-    print(pd.crosstab(j["layer1_PT"].map({True: "移轉", False: "未移轉"}),
-                      j["layer2_PT"].map({True: "移轉", False: "未移轉"})).to_string(), "\n")
-test_l2 = judge[(judge["split"] == "test") & (judge["layer1_PT"] | judge["layer2_PT"])].reset_index(drop=True)
-print("測試集中任一層判定為移轉的片段：")
-print(test_l2[["H_ID", "shared_start_frame", "shared_end_frame", "shared_duration_fs",
-               "O_A", "O_B", "layer1_PT", "layer2_PT", "P_transfer", "transfer_frame", "n_side_switches"]].to_string(index=False))
-print("\nP_transfer = 回到 L 後 STABLE_FS 個 frame 在 O_B 側的平均後驗機率；n_side_switches = 片段內 O_A/O_B 側切換次數；transfer_frame = 質子最後一次越到 O_B 側的時間（第二層才有的資訊）")
-print("所有片段 P_transfer 分布：")
-print(pd.cut(judge["P_transfer"], [-0.01, 0.01, 0.1, 0.5, 0.9, 0.99, 1.0]).value_counts().sort_index().to_string())
-
-# %%
-# [16] 第二層 HMM 作圖：(a) δ 分布與兩個高斯 (b) 第二層轉移矩陣 (c) 測試集第二層判定移轉事件的共享期盒型圖
-fig, axes = plt.subplots(1, 3, figsize=(16, 4.6), gridspec_kw={"width_ratios": [1.2, 1, 1.3]})
-ax = axes[0]
-allx = np.concatenate([s["delta"] for s in train_seqs])
-ax.hist(allx, bins=120, density=True, color="#bbbbbb", alpha=0.7, label="train δ")
-xx = np.linspace(allx.min(), allx.max(), 400)
-for st, c in [(side_A, "#3569A8"), (side_B, "#D46A4C")]:
-    wgt = gamma.sum(axis=(0, 1))[st] / gamma.sum()
-    ax.plot(xx, wgt * np.exp(-0.5 * (xx - mu2[st]) ** 2 / var2[st]) / np.sqrt(2 * np.pi * var2[st]),
-            color=c, lw=2, label=names2[st])
-ax.set_xlabel("δ = r(H,O_A) − r(H,O_B) (Å)"); ax.set_ylabel("Density"); ax.legend(frameon=False, fontsize=8)
-ax.set_title("Layer-2 emission")
-
-ax = axes[1]
-B = A2[np.ix_(o2, o2)]
-im = ax.imshow(B, cmap="Blues", vmin=0, vmax=1)
-for i in range(2):
-    for j in range(2):
-        ax.text(j, i, f"{B[i, j]:.4f}", ha="center", va="center", color="white" if B[i, j] > 0.5 else "black")
-ax.set_xticks([0, 1]); ax.set_xticklabels(lab2); ax.set_yticks([0, 1]); ax.set_yticklabels(lab2)
-ax.set_title("Layer-2 transition matrix"); fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
-ax = axes[2]
-tp2 = judge[(judge["split"] == "test") & judge["layer2_PT"]].reset_index(drop=True)
-if len(tp2):
-    ax.boxplot(tp2["shared_duration_fs"], showfliers=True)
-    xs = np.linspace(0.90, 1.10, len(tp2)); cmap = plt.get_cmap("tab10")
-    for k, (h, g) in enumerate(tp2.groupby("H_ID", sort=True)):
-        txt = "; ".join(f"{a}-{b} fs" for a, b in zip(g["shared_start_frame"], g["shared_end_frame"]))
-        ax.scatter(xs[g.index], g["shared_duration_fs"], s=55, color=cmap(k % 10), edgecolor="black",
-                   linewidth=0.5, zorder=3, label=f"H{h} (S: {txt})")
-    ax.legend(title="Hydrogen atom", frameon=False, fontsize=7, title_fontsize=8,
-              loc="upper left", bbox_to_anchor=(1.02, 1))
-    ax.set_xticks([1]); ax.set_xticklabels(["Test set"])
-else:
-    ax.text(0.5, 0.5, "No layer-2 transfers in test set", ha="center", va="center")
-ax.set_ylabel("Middle Shared-like duration (fs)"); ax.set_title("Test-set layer-2 PT episodes")
-fig.tight_layout()
-
-# %%
-# [17] 測試集各片段的 δ(t) 與第二層解碼狀態（藍 = O_A 側，紅 = O_B 側；灰底 = 第一層 Shared-like 區段；紅虛線 = 移轉時間）
-show = [s for s in seqs if s["split"] == "test" and (s["layer1_PT"] or
-        judge.loc[(judge["H_ID"] == s["H_ID"]) & (judge["shared_start_frame"] == s["s0"]), "layer2_PT"].any())]
-if show:
-    ncol = 2; nrow = (len(show) + 1) // ncol
-    fig, axes = plt.subplots(nrow, ncol, figsize=(12, 3.0 * nrow), squeeze=False)
-    for ax, s in zip(axes.ravel(), show):
-        ax.axvspan(s["s0"], s["s1"], color="#999999", alpha=0.15)
-        col = np.where(s["path"] == side_B, "#D46A4C", "#3569A8")
-        ax.scatter(s["frames"], s["delta"], c=col, s=5)
-        ax.axhline(0, color="black", lw=0.6, ls=":")
-        tf = judge.loc[(judge["H_ID"] == s["H_ID"]) & (judge["shared_start_frame"] == s["s0"]), "transfer_frame"].iloc[0]
-        if pd.notna(tf):
-            ax.axvline(tf, color="#D46A4C", lw=1, ls="--")
-        l2 = judge.loc[(judge["H_ID"] == s["H_ID"]) & (judge["shared_start_frame"] == s["s0"]), "layer2_PT"].iloc[0]
-        ax.set_title(f"H{s['H_ID']}  O{s['O_A']}->O{s['O_B']}  layer-1: {'PT' if s['layer1_PT'] else 'no PT'}"
-                     f"  layer-2: {'PT' if l2 else 'no PT'}", fontsize=9)
-        ax.set_xlabel("Frame (fs)"); ax.set_ylabel("δ (Å)")
-    for ax in axes.ravel()[len(show):]:
-        ax.axis("off")
-    fig.tight_layout()
