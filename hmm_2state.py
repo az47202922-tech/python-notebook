@@ -29,7 +29,14 @@ FEATURES = ["r1_A", "log_gap", "O1_H_O2_angle_deg"]
 if ARC_PATH is None:
     found = sorted(glob.glob("*.arc") + glob.glob("*.ARC"))
     if not found:
-        raise FileNotFoundError("找不到 .arc 檔，請先按上方「📂 上傳檔案」上傳 ARC 軌跡檔。")
+        try:                                    # Google Colab：跳出檔案選擇視窗上傳
+            from google.colab import files
+            print("請選擇 ARC 軌跡檔（.arc）上傳…")
+            found = sorted(n for n in files.upload() if n.lower().endswith(".arc"))
+        except ImportError:
+            pass
+    if not found:
+        raise FileNotFoundError("找不到 .arc 檔，請先上傳 ARC 軌跡檔（網頁版：按上方「📂 上傳檔案」）。")
     ARC_PATH = found[0]
 print("ARC 檔：", ARC_PATH, f"({os.path.getsize(ARC_PATH) / 1e6:.1f} MB)")
 
