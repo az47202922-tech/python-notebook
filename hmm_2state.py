@@ -9,7 +9,7 @@
 #   [1] 參數設定  [2] 讀取 ARC  [3] 計算每個 H 的 r1、r2、角度
 #   [4] 7:3 切分訓練/測試集  [5] HMM 函式  [6] 訓練
 #   [7] 查看模型參數  [8] 解碼與作圖  [9] 轉移矩陣熱圖
-#   [10] 質子移轉事件判定（L→S→L）  [11] 測試集共享期盒型圖
+#   [10] 質子移轉事件判定（C→V→C）  [11] 測試集 Vibration 期盒型圖
 #   [12] 各事件鄰近氧原子距離演化
 # ============================================================
 import os, glob, re, time, warnings
@@ -239,12 +239,12 @@ print(f"訓練中：{train_x.shape[0]} 條軌跡 × {train_x.shape[1]} frames ..
 best, fits = fit_hmm(train_x, seed=SEED, restarts=RESTARTS, max_iter=MAX_ITER)
 start, trans, means_z, vars_z = best["start"], best["trans"], best["means"], best["variances"]
 
-# 換回原始單位；log_gap 平均較小的狀態 = Shared-like（H 介於兩個 O 之間）
+# 換回原始單位；log_gap 平均較小的狀態 = Vibration-like（H 介於兩個 O 之間）
 means_orig = means_z * feat_std + feat_mean
 sd_orig = np.sqrt(vars_z) * feat_std
 shared = int(np.argmin(means_orig[:, FEATURES.index("log_gap")]))
 localized = 1 - shared
-state_names = {localized: "Localized-like", shared: "Shared-like"}
+state_names = {localized: "Covalent-like", shared: "Vibration-like"}
 
 train_ll = forward_backward(train_x, start, trans, means_z, vars_z, posteriors=False)
 test_ll = forward_backward(test_x, start, trans, means_z, vars_z, posteriors=False)
@@ -297,12 +297,12 @@ print("各狀態 frame 數與平均幾何：")
 print(decoded.groupby(["split", "state"])[["r1_A", "r2_A", "gap_A", "O1_H_O2_angle_deg"]]
       .agg(["count", "mean"]).round(3).to_string())
 
-colors = {"Localized-like": "#3569A8", "Shared-like": "#D46A4C"}
+colors = {"Covalent-like": "#3569A8", "Vibration-like": "#D46A4C"}
 fig, axes = plt.subplots(2, 3, figsize=(13, 7.5))
 for ax, (col, label) in zip(axes.ravel(), [
         ("r1_A", "r1 (Å)"), ("r2_A", "r2 (Å)"), ("gap_A", "Δr = r2 − r1 (Å)"),
         ("log_gap", "log(Δr + 0.001)"), ("O1_H_O2_angle_deg", "O1–H–O2 angle (deg)")]):
-    for name in ["Localized-like", "Shared-like"]:
+    for name in ["Covalent-like", "Vibration-like"]:
         ax.hist(decoded.loc[decoded["state"] == name, col], bins=70, density=True,
                 alpha=0.55, color=colors[name], label=name)
     ax.set_xlabel(label); ax.set_ylabel("Density")
@@ -315,7 +315,7 @@ fig.tight_layout()
 
 # %%
 # [9] 轉移機率矩陣熱圖（報告圖 6）
-order = [shared, localized]                     # 列/欄順序：Shared-like, Localized-like
+order = [shared, localized]                     # 列/欄順序：Vibration-like, Covalent-like
 A = trans[np.ix_(order, order)]
 labels = [state_names[s] for s in order]
 fig, ax = plt.subplots(figsize=(5.2, 4.2))
@@ -333,22 +333,22 @@ print(pd.DataFrame(A, index=labels, columns=labels).round(4).to_string())
 
 # %%
 # [10] 質子移轉事件判定
-#   1. 以 Viterbi 解碼的狀態序列，找出完整的 L → S → L 片段（Localized → Shared → Localized）
-#   2. 記錄進入 S 前最後一個 L frame 的最近氧 O_A，以及回到 L 第一個 frame 的最近氧 O_B
+#   1. 以 Viterbi 解碼的狀態序列，找出完整的 C → V → C 片段（Covalent → Vibration → Covalent）
+#   2. 記錄進入 V 前最後一個 C frame 的最近氧 O_A，以及回到 C 第一個 frame 的最近氧 O_B
 #   3. 若 O_A ≠ O_B，判定為質子移轉候選事件；O_A = O_B 則視為震盪後回到原氧（不計）
 def lsl_episodes(hdf):
-    st = (hdf["state"].to_numpy() == "Shared-like")          # True = S, False = L
+    st = (hdf["state"].to_numpy() == "Vibration-like")          # True = V, False = C
     ox, fr = hdf["O1_ID"].to_numpy(), hdf["Frame"].to_numpy()
     rows = []
-    for b in np.where(~st[:-1] & st[1:])[0] + 1:              # L→S 的第一個 S frame
+    for b in np.where(~st[:-1] & st[1:])[0] + 1:              # C→V 的第一個 V frame
         back = np.where(~st[b:])[0]
-        if not len(back):                                     # 軌跡結束前沒有回到 L，不算完整片段
+        if not len(back):                                     # 軌跡結束前沒有回到 C，不算完整片段
             continue
-        e = b + int(back[0])                                  # 回到 L 的第一個 frame
+        e = b + int(back[0])                                  # 回到 C 的第一個 frame
         rows.append({
             "H_ID": int(hdf["H_ID"].iloc[0]), "split": hdf["split"].iloc[0],
-            "shared_start_frame": int(fr[b]), "shared_end_frame": int(fr[e - 1]),
-            "shared_duration_fs": float(e - b),               # 1 frame = 1 fs
+            "vib_start_frame": int(fr[b]), "vib_end_frame": int(fr[e - 1]),
+            "vib_duration_fs": float(e - b),               # 1 frame = 1 fs
             "O_A": int(ox[b - 1]), "O_B": int(ox[e]),
         })
     return rows
@@ -359,31 +359,31 @@ episodes["PT_candidate"] = episodes["O_A"] != episodes["O_B"]
 pt = episodes[episodes["PT_candidate"]].reset_index(drop=True)
 pt.insert(0, "PT_id", np.arange(1, len(pt) + 1))
 
-print("完整 L→S→L 片段數：")
-print(episodes.groupby("split")["PT_candidate"].agg(L_S_L片段="count", 質子移轉候選="sum").to_string())
+print("完整 C→V→C 片段數：")
+print(episodes.groupby("split")["PT_candidate"].agg(C_V_C片段="count", 質子移轉候選="sum").to_string())
 test_pt = pt[pt["split"] == "test"].reset_index(drop=True)
 print(f"\n測試集質子移轉候選事件（{len(test_pt)} 筆）：")
-print(test_pt[["H_ID", "shared_start_frame", "shared_end_frame", "shared_duration_fs", "O_A", "O_B"]].to_string(index=False))
+print(test_pt[["H_ID", "vib_start_frame", "vib_end_frame", "vib_duration_fs", "O_A", "O_B"]].to_string(index=False))
 
 # %%
-# [11] 測試集質子移轉候選事件：中間 Shared-like 持續時間盒型圖（報告圖 7）
+# [11] 測試集質子移轉候選事件：中間 Vibration-like 持續時間盒型圖（報告圖 7）
 fig, ax = plt.subplots(figsize=(8.2, 4.8))
 if len(test_pt):
-    ax.boxplot(test_pt["shared_duration_fs"], showfliers=True)
+    ax.boxplot(test_pt["vib_duration_fs"], showfliers=True)
     xs = np.linspace(0.90, 1.10, len(test_pt))
-    cmap = plt.get_cmap("tab10")
+    cmap = plt.get_cmap("tab10" if test_pt["H_ID"].nunique() <= 10 else "tab20")
     for k, (h, g) in enumerate(test_pt.groupby("H_ID", sort=True)):
-        rng_txt = "; ".join(f"{a}-{b} fs" for a, b in zip(g["shared_start_frame"], g["shared_end_frame"]))
-        ax.scatter(xs[g.index], g["shared_duration_fs"], s=55, color=cmap(k % 10),
-                   edgecolor="black", linewidth=0.5, zorder=3, label=f"H{h} (S: {rng_txt})")
+        rng_txt = "; ".join(f"{a}-{b} fs" for a, b in zip(g["vib_start_frame"], g["vib_end_frame"]))
+        ax.scatter(xs[g.index], g["vib_duration_fs"], s=55, color=cmap(k % cmap.N),
+                   edgecolor="black", linewidth=0.5, zorder=3, label=f"H{h} (V: {rng_txt})")
     ax.legend(title="Hydrogen atom", frameon=False, fontsize=8, title_fontsize=9,
               loc="upper left", bbox_to_anchor=(1.02, 1))
     ax.set_xticks([1]); ax.set_xticklabels(["Test set"])
-    print(test_pt["shared_duration_fs"].describe().round(1).to_string())
+    print(test_pt["vib_duration_fs"].describe().round(1).to_string())
 else:
     ax.text(0.5, 0.5, "No test-set PT candidates", ha="center", va="center")
-ax.set_ylabel("Middle Shared-like duration in L-S-L (fs)")
-ax.set_title("Test-set PT-containing L-S-L episodes")
+ax.set_ylabel("Middle Vibration-like duration in C-V-C (fs)")
+ax.set_title("Test-set PT-containing C-V-C episodes")
 fig.tight_layout()
 
 # %%
@@ -400,11 +400,11 @@ if hs:
         for k, (o, q) in enumerate(pts.groupby("O", sort=False)):
             ax.scatter(q["Frame"], q["r"], s=4, color=plt.get_cmap("tab20")(k % 20), label=f"O{o}")
         for _, ev in test_pt[test_pt["H_ID"] == h].iterrows():
-            ax.axvspan(ev["shared_start_frame"], ev["shared_end_frame"], color="#D46A4C", alpha=0.12)
+            ax.axvspan(ev["vib_start_frame"], ev["vib_end_frame"], color="#D46A4C", alpha=0.12)
         ax.set_title(f"H{h}: nearest 2 O atoms by frame")
         ax.set_xlabel("Frame (fs)"); ax.set_ylabel("Distance (Å)")
         ax.legend(title="Nearest O atom", fontsize=7, markerscale=3, ncol=2, frameon=False)
     for ax in axes.ravel()[len(hs):]:
         ax.axis("off")
     fig.tight_layout()
-    print("淡紅色區塊 = 該事件中間的 Shared-like 區段")
+    print("淡紅色區塊 = 該事件中間的 Vibration-like 區段")
